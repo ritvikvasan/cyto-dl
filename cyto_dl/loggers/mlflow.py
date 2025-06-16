@@ -12,6 +12,8 @@ from pynvml import (
     nvmlShutdown,
     nvmlDeviceGetHandleByIndex,
     nvmlDeviceGetMemoryInfo,
+    nvmlDeviceGetUtilizationRates,
+    nvmlDeviceGetPowerUsage,
     NVMLError,
 )
 import mlflow
@@ -69,36 +71,52 @@ class MLFlowLogger(_MLFlowLogger):
 
     def start_system_metrics_logging(self, interval: int = 5):
         """
-        Starts a background thread that logs CPU, memory, and GPU usage to MLflow every `interval` seconds.
+        Starts a background thread that logs detailed system metrics to MLflow every `interval` seconds.
+        Metrics include CPU, memory, disk, GPU, and more — all in GB where applicable.
         """
+
         def log_metrics_loop():
             try:
                 nvmlInit()
                 handle = nvmlDeviceGetHandleByIndex(0)
             except NVMLError:
-                log.warning("Unable to initialize NVML for GPU monitoring.")
-                return
+                handle = None
 
             while getattr(threading.current_thread(), "keep_running", True):
                 cpu = psutil.cpu_percent()
-                mem = psutil.virtual_memory().percent
+                mem = psutil.virtual_memory()
+                swap = psutil.swap_memory()
+                load_avg = os.getloadavg()[0]
+                io = psutil.disk_io_counters()
+
+                metrics = {
+                    "system/cpu_percent": cpu,
+                    "system/cpu_load_avg_1m": load_avg,
+                    "system/ram_used_gb": round(mem.used / 1e9, 2),
+                    "system/ram_total_gb": round(mem.total / 1e9, 2),
+                    "system/ram_percent": mem.percent,
+                    "system/swap_used_gb": round(swap.used / 1e9, 2),
+                    "system/swap_total_gb": round(swap.total / 1e9, 2),
+                    "system/disk_read_gb": round(io.read_bytes / 1e9, 2),
+                    "system/disk_write_gb": round(io.write_bytes / 1e9, 2),
+                }
+
+                if handle is not None:
+                    try:
+                        gpu_mem = nvmlDeviceGetMemoryInfo(handle)
+                        util = nvmlDeviceGetUtilizationRates(handle)
+                        metrics.update({
+                            "system/gpu_mem_used_gb": round(gpu_mem.used / 1e9, 2),
+                            "system/gpu_mem_free_gb": round(gpu_mem.free / 1e9, 2),
+                            "system/gpu_mem_total_gb": round(gpu_mem.total / 1e9, 2),
+                            "system/gpu_util_percent": util.gpu,
+                            "system/gpu_power_usage_w": round(nvmlDeviceGetPowerUsage(handle) / 1000.0, 2),
+                        })
+                    except NVMLError:
+                        pass
 
                 try:
-                    gpu_mem = nvmlDeviceGetMemoryInfo(handle)
-                    gpu_used = gpu_mem.used // (1024 * 1024)  # MB
-                except NVMLError:
-                    gpu_used = 0
-
-                try:
-                    mlflow.log_metrics(
-                        {
-                            "system/cpu_percent": cpu,
-                            "system/mem_percent": mem,
-                            "system/gpu_mem_used_mb": gpu_used,
-                        },
-                        step=int(time.time()),
-                        run_id=self.run_id,
-                    )
+                    mlflow.log_metrics(metrics, step=int(time.time()), run_id=self.run_id)
                 except Exception as e:
                     if self.fault_tolerant:
                         log.warn(f"[MLFlowLogger] Failed to log system metrics: {e}")
@@ -118,7 +136,7 @@ class MLFlowLogger(_MLFlowLogger):
         )
         self._sys_metrics_thread.keep_running = True
         self._sys_metrics_thread.start()
-
+        
     def stop_system_metrics_logging(self):
         """Stops the system metrics thread cleanly."""
         if hasattr(self, "_sys_metrics_thread"):
