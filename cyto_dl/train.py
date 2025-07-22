@@ -126,7 +126,13 @@ def train(cfg: DictConfig, data=None) -> Tuple[dict, dict]:
         mlflow_logger.stop_system_metrics_logging()
 
     logger = trainer.logger 
-    logger.log_profiler_artifacts(cfg.paths.output_dir + "/profile")
+    if logger:
+        for lg in logger if isinstance(logger, list) else [logger]:
+            if hasattr(lg, 'log_profiler_artifacts'):
+                try:
+                    lg.log_profiler_artifacts(str(Path(cfg.paths.output_dir) / "profile"))
+                except Exception as e:
+                    log.warning(f"Could not log profiler artifacts for {type(lg).__name__}: {e}")
     train_metrics = trainer.callback_metrics
 
     if cfg.get("test"):
